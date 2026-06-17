@@ -1,15 +1,27 @@
 // =============================================================
 // xylophone.ino  —  楽器 Arduino 共通プログラム（木琴用）
+// irtp ライブラリ: 篠崎版（実物）対応
 // =============================================================
+
 
 #include "irtp.h"
 #include "Arduino_LED_Matrix.h"
+
 
 // =============================================================
 // ★ INSTRUMENT SETTINGS★  楽器ごとにここだけ変更する
 // =============================================================
 static const char* INSTRUMENT_NAME = "xylophone";
-static const float roundOffset     = 12.0f;
+static const uint8_t MY_INSTRUMENT_ID = 3;  // 0:trumpet 1:drum 2:organ 3:xylophone 4:harp
+float roundOffset = 12.0f;                   // 動的変数（設定カプセルで上書き可能）
+
+
+// =============================================================
+// カプセル種別定義（畑戸・大嶺との合意後に確定）
+// =============================================================
+static const uint8_t CAPSULE_TYPE_BPM    = 0x01;  // 通常カプセル: BPM + timing
+static const uint8_t CAPSULE_TYPE_CONFIG = 0x02;  // 設定カプセル: roundOffset変更
+
 
 // =============================================================
 // 譜面格納（phoneme 構造体 ＋ 楽譜データ配列）
@@ -20,6 +32,7 @@ float    length;
 char     pitch[4];
 uint8_t  volume;
 };
+
 
 static const Phoneme PROGMEM score[] = {
   { 0.0f,  1.0f, "C4",  80 },
@@ -42,6 +55,7 @@ static const Phoneme PROGMEM score[] = {
 };
 static const int SCORE_LEN = sizeof(score) / sizeof(score[0]);
 
+
 // =============================================================
 // ピン定数・通信定数
 // =============================================================
@@ -50,10 +64,12 @@ static const uint8_t  DEMO_PIN        = 3;
 static const uint32_t SERIAL_BAUD     = 115200;
 static const uint32_t STOP_TIMEOUT_MS = 2000;
 
+
 // =============================================================
 // 状態管理・グローバル変数
 // =============================================================
 enum State { IDLE, PLAYING, DEMO };
+
 
 State    state         = IDLE;
 float    currentTiming = 0.0f;
@@ -62,15 +78,18 @@ uint32_t lastUpdateMs  = 0;
 uint32_t lastPacketMs  = 0;
 int      lastSentIndex = -1;
 
+
 // LED フラッシュタイマー（非ブロッキング）
 static uint32_t flashEndMs = 0;
 static int      flashRow   = -1;
+
 
 // =============================================================
 // LED マトリクス
 // =============================================================
 ArduinoLEDMatrix ledMatrix;
 static uint8_t ledFrame[8][12] = {};
+
 
 static int pitchToRow(const char* pitch) {
 if (strcmp(pitch, "DR") == 0) return 7;
@@ -81,6 +100,7 @@ if (row < 0) row = 0;
 if (row > 6) row = 6;
 return row;
 }
+
 
 static void ledScroll(int row, bool flash) {
 for (int r = 0; r < 8; r++) {
@@ -97,15 +117,18 @@ ledFrame[row][11] = 1;
 ledMatrix.loadPixels(&ledFrame[0][0], 8 * 12);
 }
 
+
 static void ledClear() {
 memset(ledFrame, 0, sizeof(ledFrame));
 ledMatrix.loadPixels(&ledFrame[0][0], 8 * 12);
 }
 
+
 static void ledAllOn() {
 memset(ledFrame, 1, sizeof(ledFrame));
 ledMatrix.loadPixels(&ledFrame[0][0], 8 * 12);
 }
+
 
 // =============================================================
 // 停止処理
@@ -118,24 +141,55 @@ static void stopPlayback() {
 ledClear();
 }
 
+
 // =============================================================
-// 赤外線受信コールバック
+// 赤外線受信コールバック（篠崎版 irtp 対応）
 // =============================================================
 IrtpReceiver* receiver;
 
-void onCapsuleReceived(int result, uint8_t* data, uint16_t length) {
-if (result != 0) return;
+
+void onCapsuleReceived(int8_t result, IrtpPayload& payload) {
+if (result != 0) return;  // チェックサムエラー or パース失敗
+
 
   lastPacketMs = millis();
 
-uint8_t bpm = data[0];
+
+  // --- ペイロード解釈 ---
+  // 暫定フォーマット（畑戸・大嶺との合意後に確定）:
+  //   bytes[0]    : カプセル種別 (0x01=BPM, 0x02=設定)
+  //   --- TYPE_BPM (0x01) ---
+  //   bytes[1]    : BPM (uint8_t)
+  //   bytes[2..5] : timing (float, リトルエンディアン)
+  //   --- TYPE_CONFIG (0x02) ---
+  //   bytes[1]    : 対象楽器ID (0-4)
+  //   bytes[2..5] : roundOffset (float, リトルエンディアン)
+
+
+uint8_t capsuleType = payload.bytes[0];
+
+
+if (capsuleType == CAPSULE_TYPE_CONFIG) {
+    // 設定カプセル: 自分宛なら roundOffset を上書き
+uint8_t targetId = payload.bytes[1];
+if (targetId == MY_INSTRUMENT_ID) {
+memcpy(&roundOffset, &payload.bytes[2], sizeof(float));
+    }
+return;
+  }
+
+
+  // 通常カプセル (TYPE_BPM) として処理
+uint8_t bpm = payload.bytes[1];
 float   recvTiming;
-memcpy(&recvTiming, data + 1, sizeof(float));
+memcpy(&recvTiming, &payload.bytes[2], sizeof(float));
+
 
 if (bpm == 0) {
 stopPlayback();
 return;
   }
+
 
 if (state == IDLE || state == DEMO) {
     currentBpm    = bpm;
@@ -146,6 +200,7 @@ if (state == IDLE || state == DEMO) {
 return;
   }
 
+
 if (currentBpm != bpm) currentBpm = bpm;
 float expectedTiming = recvTiming + roundOffset;
 if (abs(currentTiming - expectedTiming) > 0.05f) {
@@ -153,6 +208,7 @@ if (abs(currentTiming - expectedTiming) > 0.05f) {
     lastUpdateMs  = millis();
   }
 }
+
 
 // =============================================================
 // 内部再生地点の自律更新
@@ -165,6 +221,7 @@ float elapsed = (now - lastUpdateMs) / 1000.0f;
   lastUpdateMs = now;
 }
 
+
 // =============================================================
 // 音要素検索 + USB シリアル出力
 // =============================================================
@@ -174,11 +231,13 @@ for (int i = lastSentIndex + 1; i < SCORE_LEN; i++) {
 memcpy_P(&p, &score[i], sizeof(Phoneme));
 if (p.timing > currentTiming) break;
 
+
 char buf[96];
 snprintf(buf, sizeof(buf),
 "{\"instrument\":\"%s\",\"length\":%.2f,\"pitch\":\"%s\",\"volume\":%d}",
              INSTRUMENT_NAME, p.length, p.pitch, (int)p.volume);
 Serial.println(buf);
+
 
 int row = pitchToRow(p.pitch);
 if (p.volume == 0) {
@@ -189,9 +248,11 @@ ledScroll(row, true);
       flashEndMs = millis() + 30;
     }
 
+
     lastSentIndex = i;
   }
 }
+
 
 // =============================================================
 // タイムアウト・曲終端チェック
@@ -201,10 +262,12 @@ if (state != PLAYING) return;
 if (millis() - lastPacketMs > STOP_TIMEOUT_MS) stopPlayback();
 }
 
+
 static void checkEndOfScore() {
 if (state != PLAYING) return;
 if (lastSentIndex >= SCORE_LEN - 1) stopPlayback();
 }
+
 
 // =============================================================
 // デモ再生モード
@@ -220,6 +283,7 @@ if (digitalRead(DEMO_PIN) == LOW) {
   }
 }
 
+
 // =============================================================
 // setup / loop
 // =============================================================
@@ -228,29 +292,36 @@ Serial.begin(SERIAL_BAUD);
 pinMode(IR_PIN,   INPUT);
 pinMode(DEMO_PIN, INPUT_PULLUP);
 
+
 ledMatrix.begin();
 ledAllOn();
 delay(200);
 ledClear();
 
+
   receiver = new IrtpReceiver(IR_PIN);
+receiver->init();  // 篠崎版: pinMode設定 + activeInstance登録
 receiver->setReceiveCallback(onCapsuleReceived);
 }
+
 
 void loop() {
 receiver->update();
 handleDemoPin();
 updateTiming();
 
+
 if (state == PLAYING || state == DEMO) {
 sendPendingPhonemes();
   }
+
 
   // LED フラッシュ終了処理（非ブロッキング）
 if (flashRow >= 0 && millis() >= flashEndMs) {
 ledScroll(flashRow, false);
     flashRow = -1;
   }
+
 
 checkTimeout();
 checkEndOfScore();
